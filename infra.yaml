@@ -1,0 +1,330 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for Microservices ECS Deploy lab'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Default VPC ID
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets in the Default VPC
+  GitHubOrg:
+    Type: String
+    Description: GitHub Organization or User
+    Default: 'SeanShmilov'
+  GitHubRepo:
+    Type: String
+    Description: GitHub Repository Name
+    Default: 'microservices-ecs-lab'
+
+Resources:
+  # ---------------------------------------------------------
+  # ECR Repositories
+  # ---------------------------------------------------------
+  InventoryRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: 'inventory-service'
+      EmptyOnDelete: true
+
+  OrdersRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: 'orders-service'
+      EmptyOnDelete: true
+
+  # ---------------------------------------------------------
+  # CloudWatch Log Groups
+  # ---------------------------------------------------------
+  InventoryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/ecs/inventory-service'
+      RetentionInDays: 7
+
+  OrdersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/ecs/orders-service'
+      RetentionInDays: 7
+
+  # ---------------------------------------------------------
+  # IAM Roles
+  # ---------------------------------------------------------
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'ecsTaskExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'ecs-tasks.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+  GithubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: 'https://token.actions.githubusercontent.com'
+      ClientIdList:
+        - 'sts.amazonaws.com'
+      ThumbprintList:
+        - '1b511abead59c6ce207077c0bf0e0043b1382612'
+        - '6938fd4d98bab03faadb97b34396831e3780aea1'
+        - '1c58a3a8518e8759bf075b76b750d4f2df264fcd'
+
+  GithubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'GithubActionsEcsDeployRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GithubOidcProvider
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringLike:
+                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubOrg}/${GitHubRepo}:*'
+      Policies:
+        - PolicyName: 'EcsDeployPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecr:GetAuthorizationToken'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:GetRepositoryPolicy'
+                  - 'ecr:DescribeRepositories'
+                  - 'ecr:ListImages'
+                  - 'ecr:DescribeImages'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:InitiateLayerUpload'
+                  - 'ecr:UploadLayerPart'
+                  - 'ecr:CompleteLayerUpload'
+                  - 'ecr:PutImage'
+                Resource: 
+                  - !GetAtt InventoryRepo.Arn
+                  - !GetAtt OrdersRepo.Arn
+              - Effect: Allow
+                Action:
+                  - 'ecs:RegisterTaskDefinition'
+                  - 'ecs:DescribeTaskDefinition'
+                  - 'ecs:UpdateService'
+                  - 'ecs:DescribeServices'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource: !GetAtt EcsTaskExecutionRole.Arn
+
+  # ---------------------------------------------------------
+  # ECS Cluster & CloudMap
+  # ---------------------------------------------------------
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: 'microsvc-cluster'
+
+  CloudMapNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: 'microsvc.local'
+      Vpc: !Ref VpcId
+
+  # ---------------------------------------------------------
+  # Security Groups
+  # ---------------------------------------------------------
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'ALB inbound from internet'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTP from internet'
+
+  OrdersSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'orders task, ALB only'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !GetAtt AlbSg.GroupId
+          Description: '8080 from alb-sg'
+
+  InventorySg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'inventory task, orders only'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !GetAtt OrdersSg.GroupId
+          Description: '8080 from orders-sg'
+
+  # ---------------------------------------------------------
+  # Application Load Balancer
+  # ---------------------------------------------------------
+  OrdersAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: 'orders-alb'
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !GetAtt AlbSg.GroupId
+      Type: application
+
+  OrdersTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: 'orders-tg'
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: '/health'
+      Matcher:
+        HttpCode: '200'
+
+  OrdersListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref OrdersAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref OrdersTargetGroup
+
+  # ---------------------------------------------------------
+  # Task Definitions (Initial Dummy ones)
+  # ---------------------------------------------------------
+  InventoryTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: 'inventory-service'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: 'inventory'
+          Image: 'alpine:latest' # Dummy image, Github Actions will update this
+          Command: ['sleep', '3600']
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+              Name: 'inventory'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref InventoryLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: 'ecs'
+
+  OrdersTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: 'orders-service'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: 'orders'
+          Image: 'alpine:latest' # Dummy image, Github Actions will update this
+          Command: ['sleep', '3600']
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+              Name: 'orders'
+          Environment:
+            - Name: 'INVENTORY_URL'
+              Value: 'http://inventory:8080'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref OrdersLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: 'ecs'
+
+  # ---------------------------------------------------------
+  # ECS Services
+  # ---------------------------------------------------------
+  InventoryService:
+    Type: AWS::ECS::Service
+    DependsOn: OrdersListener
+    Properties:
+      Cluster: !Ref EcsCluster
+      ServiceName: 'inventory-service'
+      TaskDefinition: !Ref InventoryTaskDef
+      DesiredCount: 0 # GitHub Actions will deploy and scale this
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !GetAtt InventorySg.GroupId
+          Subnets: !Ref SubnetIds
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: 'microsvc.local'
+        Services:
+          - PortName: 'inventory'
+            ClientAliases:
+              - Port: 8080
+                DnsName: 'inventory'
+
+  OrdersService:
+    Type: AWS::ECS::Service
+    DependsOn: OrdersListener
+    Properties:
+      Cluster: !Ref EcsCluster
+      ServiceName: 'orders-service'
+      TaskDefinition: !Ref OrdersTaskDef
+      DesiredCount: 0 # GitHub Actions will deploy and scale this
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !GetAtt OrdersSg.GroupId
+          Subnets: !Ref SubnetIds
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: 'microsvc.local'
+      LoadBalancers:
+        - TargetGroupArn: !Ref OrdersTargetGroup
+          ContainerName: 'orders'
+          ContainerPort: 8080
+
+Outputs:
+  AlbUrl:
+    Description: 'URL of the Application Load Balancer'
+    Value: !Sub 'http://${OrdersAlb.DNSName}'
+  DeployRoleArn:
+    Description: 'ARN of the IAM Role for GitHub Actions'
+    Value: !GetAtt GithubDeployRole.Arn
